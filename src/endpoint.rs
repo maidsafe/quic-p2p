@@ -231,7 +231,7 @@ impl Endpoint {
         let mut addr = None;
 
         #[cfg(feature = "no-igd")]
-        if self.qp2p_config.forward_port {
+        if self.qp2p_config.use_igd {
             warn!("Ignoring 'forward_port' flag from config since IGD has been disabled (feature 'no-igd' has been set)");
         }
 
@@ -248,7 +248,7 @@ impl Endpoint {
         }
 
         #[cfg(not(feature = "no-igd"))]
-        if addr.is_none() && self.qp2p_config.forward_port {
+        if self.qp2p_config.use_igd {
             // Attempt to use IGD for port forwarding
             match timeout(
                 Duration::from_secs(PORT_FORWARD_TIMEOUT),

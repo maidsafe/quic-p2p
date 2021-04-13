@@ -45,7 +45,7 @@ pub struct Config {
     /// Specify if port forwarding via UPnP should be done or not. This can be set to false if the network
     /// is run locally on the network loopback or on a local area network.
     #[structopt(long)]
-    pub forward_port: bool,
+    pub use_igd: bool,
     /// External port number assigned to the socket address of the program.
     /// If this is provided, QP2p considers that the local port provided has been mapped to the
     /// provided external port number and automatic port forwarding will be skipped.
