@@ -364,7 +364,7 @@ async fn many_messages() -> Result<()> {
 
     utils::init_logging();
 
-    let num_messages: usize = 10_000;
+    let num_messages: usize = 20_000;
 
     let qp2p = new_qp2p()?;
     let (send_endpoint, _, _, _) = qp2p.new_endpoint().await?;
