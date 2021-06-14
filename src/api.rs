@@ -304,7 +304,7 @@ impl QuicP2p {
 // Private helpers
 
 // Bind a new socket with a local address
-fn bind(
+pub(crate) fn bind(
     endpoint_cfg: quinn::ServerConfig,
     local_addr: SocketAddr,
     allow_random_port: bool,
