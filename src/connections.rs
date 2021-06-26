@@ -18,7 +18,7 @@ use bytes::Bytes;
 use futures::{future, stream::StreamExt};
 use log::{error, trace, warn};
 use std::net::SocketAddr;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio::time::{timeout, Duration};
 
 /// Connection instance to a node which can be used to send messages to it
@@ -139,13 +139,14 @@ pub async fn send_msg(mut send_stream: &mut quinn::SendStream, msg: Bytes) -> Re
 pub(super) fn listen_for_incoming_connections(
     mut quinn_incoming: quinn::Incoming,
     connection_pool: ConnectionPool,
-    message_tx: UnboundedSender<(SocketAddr, Bytes)>,
-    connection_tx: UnboundedSender<SocketAddr>,
-    disconnection_tx: UnboundedSender<SocketAddr>,
+    message_tx: Sender<(SocketAddr, Bytes)>,
+    connection_tx: Sender<SocketAddr>,
+    disconnection_tx: Sender<SocketAddr>,
     endpoint: Endpoint,
 ) {
     let _ = tokio::spawn(async move {
         loop {
+            log::debug!("qp2p loooooooooooooooooooooooooooooop");
             match quinn_incoming.next().await {
                 Some(quinn_conn) => match quinn_conn.await {
                     Ok(quinn::NewConnection {
@@ -154,9 +155,10 @@ pub(super) fn listen_for_incoming_connections(
                         bi_streams,
                         ..
                     }) => {
+                        log::debug!("qp2p another incoming connnn");
                         let peer_address = connection.remote_address();
                         let pool_handle = connection_pool.insert(peer_address, connection).await;
-                        let _ = connection_tx.send(peer_address);
+                        let _ = connection_tx.send(peer_address).await;
                         listen_for_incoming_messages(
                             uni_streams,
                             bi_streams,
@@ -187,12 +189,13 @@ pub(super) fn listen_for_incoming_messages(
     mut uni_streams: quinn::IncomingUniStreams,
     mut bi_streams: quinn::IncomingBiStreams,
     remover: ConnectionRemover,
-    message_tx: UnboundedSender<(SocketAddr, Bytes)>,
-    disconnection_tx: UnboundedSender<SocketAddr>,
+    message_tx: Sender<(SocketAddr, Bytes)>,
+    disconnection_tx: Sender<SocketAddr>,
     endpoint: Endpoint,
 ) {
     let src = *remover.remote_addr();
     let _ = tokio::spawn(async move {
+        log::debug!("^^^^^^^^^^^^^^^^ qp2p another incoming listerner spawned");
         let _ = future::join(
             read_on_uni_streams(&mut uni_streams, src, message_tx.clone()),
             read_on_bi_streams(&mut bi_streams, src, message_tx, &endpoint),
@@ -200,7 +203,7 @@ pub(super) fn listen_for_incoming_messages(
         .await;
 
         log::trace!("The connection to {:?} has been terminated.", src);
-        let _ = disconnection_tx.send(src);
+        let _ = disconnection_tx.send(src).await;
         remover.remove().await;
     });
 }
@@ -209,7 +212,7 @@ pub(super) fn listen_for_incoming_messages(
 async fn read_on_uni_streams(
     uni_streams: &mut quinn::IncomingUniStreams,
     peer_addr: SocketAddr,
-    message_tx: UnboundedSender<(SocketAddr, Bytes)>,
+    message_tx: Sender<(SocketAddr, Bytes)>,
 ) {
     while let Some(result) = uni_streams.next().await {
         match result {
@@ -227,7 +230,7 @@ async fn read_on_uni_streams(
             Ok(mut recv) => loop {
                 match read_bytes(&mut recv).await {
                     Ok(WireMsg::UserMsg(bytes)) => {
-                        let _ = message_tx.send((peer_addr, bytes));
+                        let _ = message_tx.send((peer_addr, bytes)).await;
                     }
                     Ok(msg) => error!("Unexpected message type: {:?}", msg),
                     Err(Error::StreamRead(quinn::ReadExactError::FinishedEarly)) => break,
@@ -248,12 +251,13 @@ async fn read_on_uni_streams(
 async fn read_on_bi_streams(
     bi_streams: &mut quinn::IncomingBiStreams,
     peer_addr: SocketAddr,
-    message_tx: UnboundedSender<(SocketAddr, Bytes)>,
+    message_tx: Sender<(SocketAddr, Bytes)>,
     endpoint: &Endpoint,
 ) {
     while let Some(result) = bi_streams.next().await {
         match result {
-            Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+            Err(quinn::ConnectionError::ApplicationClosed { .. })
+            | Err(quinn::ConnectionError::ConnectionClosed { .. }) => {
                 trace!("Connection terminated by peer {:?}.", peer_addr);
                 break;
             }
@@ -267,7 +271,7 @@ async fn read_on_bi_streams(
             Ok((mut send, mut recv)) => loop {
                 match read_bytes(&mut recv).await {
                     Ok(WireMsg::UserMsg(bytes)) => {
-                        let _ = message_tx.send((peer_addr, bytes));
+                        let _ = message_tx.send((peer_addr, bytes)).await;
                     }
                     Ok(WireMsg::EndpointEchoReq) => {
                         if let Err(error) = handle_endpoint_echo_req(peer_addr, &mut send).await {
