@@ -60,6 +60,11 @@ webpki = "~0.21.3"
 flexi_logger = "~0.16.1"
 anyhow = "1.0.36"
 rand = "~0.7.3"
+crc = "1.8.1"
+tracing-subscriber = "0.2.16"
+tracing = "0.1.25"
+crossbeam-channel = "0.5.0"
+rustyline = "8.0.0"
 
   [dev-dependencies.tiny-keccak]
   version = "2.0.2"
