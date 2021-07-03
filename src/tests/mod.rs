@@ -14,8 +14,13 @@ use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
+use tiny_keccak::{Hasher, Sha3};
+
+/// SHA3-256 hash digest.
+type Digest256 = [u8; 32];
 
 mod common;
+mod quinn;
 
 /// Constructs a `QuicP2p` node with some sane defaults for testing.
 pub fn new_qp2p() -> Result<QuicP2p> {
@@ -41,4 +46,12 @@ pub fn new_qp2p_with_hcc(hard_coded_contacts: HashSet<SocketAddr>) -> Result<Qui
 pub fn random_msg(size: usize) -> Bytes {
     let random_bytes: Vec<u8> = (0..size).map(|_| rand::random::<u8>()).collect();
     Bytes::from(random_bytes)
+}
+
+pub fn hash(bytes: &Bytes) -> Digest256 {
+    let mut hasher = Sha3::v256();
+    let mut hash = Digest256::default();
+    hasher.update(bytes);
+    hasher.finalize(&mut hash);
+    hash
 }

@@ -7,20 +7,15 @@
 // specific language governing permissions and limitations relating to use of the SAFE Network
 // Software.
 
-use super::{new_qp2p, new_qp2p_with_hcc, random_msg};
+use super::{hash, new_qp2p, new_qp2p_with_hcc, random_msg};
 use crate::utils;
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
 use futures::future;
 use std::{
     collections::{BTreeSet, HashSet},
     time::Duration,
 };
-use tiny_keccak::{Hasher, Sha3};
 use tokio::time::timeout;
-
-/// SHA3-256 hash digest.
-type Digest256 = [u8; 32];
 
 #[tokio::test]
 async fn successful_connection() -> Result<()> {
@@ -372,14 +367,6 @@ async fn multiple_concurrent_connects_to_the_same_peer() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn hash(bytes: &Bytes) -> Digest256 {
-    let mut hasher = Sha3::v256();
-    let mut hash = Digest256::default();
-    hasher.update(bytes);
-    hasher.finalize(&mut hash);
-    hash
 }
 
 #[tokio::test]
