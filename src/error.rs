@@ -18,6 +18,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// tokio channel error when trying to send disconnect notificaiton
+    #[error("Could not send disconnect notification")]
+    DisconnectionNotification,
     /// Error occurred when attempting to connect to any
     /// of the peers provided as a list of contacts.
     #[error("Network bootstrap failed")]
