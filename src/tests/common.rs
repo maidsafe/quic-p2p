@@ -504,11 +504,11 @@ async fn multiple_connections_with_many_larger_concurrent_messages() -> Result<(
         async move {
             let mut num_received = 0;
             let mut sending_tasks = Vec::new();
-            // assert!(!logs_contain("error"));
+            assert!(!logs_contain("error"));
 
             while let Some((src, msg)) = recv_incoming_messages.next().await {
                 tracing::info!("received from {:?} with message size {}", src, msg.len());
-                // assert!(!logs_contain("error"));
+                assert!(!logs_contain("error"));
 
                 assert_eq!(msg.len(), test_msgs[0].len());
 
@@ -526,7 +526,7 @@ async fn multiple_connections_with_many_larger_concurrent_messages() -> Result<(
                         sending_endpoint
                             .send_message(hash_result.to_vec().into(), &src)
                             .await?;
-                        // assert!(!logs_contain("error"));
+                        assert!(!logs_contain("error"));
 
                         Ok::<_, anyhow::Error>(())
                     }
@@ -542,7 +542,7 @@ async fn multiple_connections_with_many_larger_concurrent_messages() -> Result<(
             }
 
             let _ = future::try_join_all(sending_tasks).await?;
-            // assert!(!logs_contain("error"));
+            assert!(!logs_contain("error"));
 
             Ok(())
         }
