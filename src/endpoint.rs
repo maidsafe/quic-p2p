@@ -15,16 +15,18 @@ use super::{
     connection_deduplicator::ConnectionDeduplicator,
     connection_pool::ConnectionPool,
     connections::{
-        listen_for_incoming_connections, listen_for_incoming_messages, Connection,
-        DisconnectSender, DisconnectionEvents, RecvStream, SendStream,
+        listen_for_incoming_connections, listen_for_incoming_messages, manage_raw_disconnections,
+        Connection, DisconnectSender, DisconnectionEvents, RecvStream, SendStream,
     },
     error::Result,
     Config,
 };
 use bytes::Bytes;
-use std::{net::SocketAddr, time::Duration};
+use std::sync::Arc;
+use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 use tokio::sync::broadcast::{self, Receiver, Sender};
 use tokio::sync::mpsc::{self, Receiver as MpscReceiver, Sender as MpscSender};
+use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::{debug, error, info, trace, warn};
 
@@ -71,12 +73,13 @@ pub struct Endpoint {
     public_addr: Option<SocketAddr>,
     quic_endpoint: quinn::Endpoint,
     message_tx: MpscSender<(SocketAddr, Bytes)>,
-    disconnection_tx: DisconnectSender,
+    fully_disconnection_tx: DisconnectSender,
     client_cfg: quinn::ClientConfig,
     bootstrap_nodes: Vec<SocketAddr>,
     qp2p_config: Config,
     termination_tx: Sender<()>,
     connection_pool: ConnectionPool,
+    connection_attempts: Arc<RwLock<BTreeMap<SocketAddr, usize>>>,
     connection_deduplicator: ConnectionDeduplicator,
 }
 
@@ -112,7 +115,7 @@ impl Endpoint {
 
         let (message_tx, message_rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (connection_tx, connection_rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
-        let (disconnection_tx, disconnection_rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+        let (fully_disconnection_tx, fully_disconnection_rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
         let (termination_tx, termination_rx) = broadcast::channel(1);
 
         let mut endpoint = Self {
@@ -120,12 +123,13 @@ impl Endpoint {
             public_addr,
             quic_endpoint,
             message_tx: message_tx.clone(),
-            disconnection_tx: disconnection_tx.clone(),
+            fully_disconnection_tx: fully_disconnection_tx.clone(),
             client_cfg,
             bootstrap_nodes,
             qp2p_config,
             termination_tx,
             connection_pool: connection_pool.clone(),
+            connection_attempts: Arc::new(RwLock::new(BTreeMap::default())),
             connection_deduplicator: ConnectionDeduplicator::new(),
         };
 
@@ -182,6 +186,15 @@ impl Endpoint {
             endpoint.public_addr = Some(endpoint.fetch_public_address(termination_rx).await?);
         }
 
+        let (disconnection_tx, disconnection_rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
+
+        manage_raw_disconnections(
+            endpoint.connection_attempts.clone(),
+            disconnection_rx,
+            fully_disconnection_tx,
+            endpoint.clone(),
+        );
+
         listen_for_incoming_connections(
             quic_incoming,
             connection_pool,
@@ -195,7 +208,7 @@ impl Endpoint {
             endpoint,
             IncomingConnections(connection_rx),
             IncomingMessages(message_rx),
-            DisconnectionEvents(disconnection_rx),
+            DisconnectionEvents(fully_disconnection_rx),
         ))
     }
 
@@ -442,7 +455,7 @@ impl Endpoint {
             conn.bi_streams,
             guard,
             self.message_tx.clone(),
-            self.disconnection_tx.clone(),
+            self.fully_disconnection_tx.clone(),
             self.clone(),
         );
     }
@@ -489,7 +502,18 @@ impl Endpoint {
             return Ok(());
         }
         self.connect_to(dest).await?;
-        self.try_send_message(msg, dest).await
+
+        let mut attempts: usize = 0;
+        let mut res = self.try_send_message(msg.clone(), dest).await;
+
+        while attempts < 3 && res.is_err() {
+            trace!("send attempt # {:?}", attempts);
+            attempts += attempts;
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            res = self.try_send_message(msg.clone(), dest).await;
+        }
+
+        res
     }
 
     /// Close all the connections of this endpoint immediately and stop accepting new connections.

@@ -16,10 +16,12 @@ use super::{
 };
 use bytes::Bytes;
 use futures::{future, stream::StreamExt};
-use std::net::SocketAddr;
+use std::sync::Arc;
+use std::{collections::BTreeMap, net::SocketAddr};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
-use tracing::{error, trace, warn};
+use tracing::{error, trace, warn, debug};
 
 /// Connection instance to a node which can be used to send messages to it
 #[derive(Clone)]
@@ -31,6 +33,8 @@ pub(crate) struct Connection {
 pub type DisconnectSender = Sender<(SocketAddr, Result<()>)>;
 /// Disconnection events, and the result that led to disconnection.
 pub struct DisconnectionEvents(pub Receiver<(SocketAddr, Result<()>)>);
+
+static CONNECTION_ATTEMPTS: usize = 3;
 
 /// Disconnection
 
@@ -54,7 +58,7 @@ impl Connection {
     /// Send message to peer using a uni-directional stream.
     pub async fn send_uni(&self, msg: Bytes) -> Result<()> {
         let mut send_stream = self.handle_error(self.quic_conn.open_uni().await).await?;
-        self.handle_error(send_msg(&mut send_stream, msg).await)
+        self.handle_error(send_msg(&mut send_stream, msg.clone()).await)
             .await?;
 
         // We try to make sure the stream is gracefully closed and the bytes get sent,
@@ -149,6 +153,58 @@ pub async fn send_msg(mut send_stream: &mut quinn::SendStream, msg: Bytes) -> Re
     Ok(())
 }
 
+pub(super) fn manage_raw_disconnections(
+    connection_attempts: Arc<RwLock<BTreeMap<SocketAddr, usize>>>,
+    mut disconnection_rx: Receiver<(SocketAddr, Result<()>)>,
+    fully_disconnected_sender: DisconnectSender,
+    endpoint: Endpoint,
+) {
+    let _ = tokio::spawn(async move {
+        loop {
+            if let Some((socket, result)) = disconnection_rx.recv().await {
+                if result.is_err() {
+                    let conn_attempts = connection_attempts.read().await;
+                    let attempts = conn_attempts.get(&socket);
+
+                    if let Some(count) = attempts {
+                        if count < &CONNECTION_ATTEMPTS {
+                            tracing::warn!("Attempting to reconnect to: {:?}", socket);
+                            // just default to a fresh connection
+                            let _ = endpoint.connect_to(&socket).await?;
+
+                            let new_count = count + 1;
+                            let _ = connection_attempts
+                                .write()
+                                .await
+                                .insert(socket.clone(), new_count);
+                        } else {
+                            error!("Removing attempt records for socket: {:?}, too many fails", socket);
+                            error!("Final connection attempt error was: {:?}", result);
+                            // do nothing more, fire full disconnection event
+                            fully_disconnected_sender
+                                .send((socket, result))
+                                .await
+                                .map_err(|_| Error::DisconnectionNotification)?;
+
+                                let _ = connection_attempts.write().await.remove(&socket);
+
+                            
+                        }
+                    } else {
+                        debug!("Attempting to reconnect to: {:?}", socket);
+                        let _ = endpoint.connect_to(&socket).await?;
+                        let _ = connection_attempts.write().await.insert(socket.clone(), 1);
+                    }
+                }
+            } else {
+                trace!("disconnection handling returned None. There will be no more disconnection management");
+                break;
+            }
+        }
+        Ok::<_, Error>(())
+    });
+}
+
 pub(super) fn listen_for_incoming_connections(
     mut quinn_incoming: quinn::Incoming,
     connection_pool: ConnectionPool,
@@ -180,8 +236,8 @@ pub(super) fn listen_for_incoming_connections(
                         );
                     }
                     Err(err) => {
-                        error!(
-                            "An incoming connection failed because of an error: {:?}",
+                        warn!(
+                            "An incoming connection failed because of: {:?}",
                             err
                         );
                     }
@@ -241,7 +297,7 @@ async fn read_on_uni_streams(
             }
             Err(err) => {
                 warn!(
-                    "Failed to read incoming message on uni-stream for peer {:?} with error: {:?}",
+                    "Failed to read incoming message on uni-stream for peer {:?} with: {:?}",
                     peer_addr, err
                 );
                 return Err(Error::from(err));
@@ -251,13 +307,13 @@ async fn read_on_uni_streams(
                     Ok(WireMsg::UserMsg(bytes)) => {
                         let _ = message_tx.send((peer_addr, bytes)).await;
                     }
-                    Ok(msg) => error!("Unexpected message type: {:?}", msg),
+                    Ok(msg) => warn!("Unexpected message type: {:?}", msg),
                     Err(Error::StreamRead(quinn::ReadExactError::FinishedEarly)) => {
                         return Err(Error::StreamRead(quinn::ReadExactError::FinishedEarly))
                     }
                     Err(err) => {
-                        error!(
-                            "Failed reading from a uni-stream for peer {:?} with error: {:?}",
+                        warn!(
+                            "Failed reading from a uni-stream for peer {:?} with: {:?}",
                             peer_addr, err
                         );
                         return Err(err);
@@ -286,7 +342,7 @@ async fn read_on_bi_streams(
             }
             Err(err) => {
                 warn!(
-                    "Failed to read incoming message on bi-stream for peer {:?} with error: {:?}",
+                    "Failed to read incoming message on bi-stream for peer {:?} with: {:?}",
                     peer_addr, err
                 );
                 return Err(Error::from(err));
@@ -298,8 +354,8 @@ async fn read_on_bi_streams(
                     }
                     Ok(WireMsg::EndpointEchoReq) => {
                         if let Err(error) = handle_endpoint_echo_req(peer_addr, &mut send).await {
-                            error!(
-                                "Failed to handle Echo Request for peer {:?} with error: {:?}",
+                            warn!(
+                                "Failed to handle Echo Request for peer {:?} with: {:?}",
                                 peer_addr, error
                             );
 
@@ -315,13 +371,13 @@ async fn read_on_bi_streams(
                         )
                         .await
                         {
-                            error!("Failed to handle Endpoint verification request for peer {:?} with error: {:?}", peer_addr, error);
+                            warn!("Failed to handle Endpoint verification request for peer {:?} with: {:?}", peer_addr, error);
 
                             return Err(error);
                         }
                     }
                     Ok(msg) => {
-                        error!(
+                        warn!(
                             "Unexpected message type from peer {:?}: {:?}",
                             peer_addr, msg
                         );
@@ -330,8 +386,8 @@ async fn read_on_bi_streams(
                         return Err(Error::StreamRead(quinn::ReadExactError::FinishedEarly))
                     }
                     Err(err) => {
-                        error!(
-                            "Failed reading from a bi-stream for peer {:?} with error: {:?}",
+                        warn!(
+                            "Failed reading from a bi-stream for peer {:?} with: {:?}",
                             peer_addr, err
                         );
                         return Err(err);
