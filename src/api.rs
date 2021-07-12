@@ -10,7 +10,8 @@
 use super::{
     bootstrap_cache::BootstrapCache,
     config::{Config, SerialisableCertificate},
-    endpoint::{DisconnectionEvents, Endpoint, IncomingConnections, IncomingMessages},
+    connections::DisconnectionEvents,
+    endpoint::{Endpoint, IncomingConnections, IncomingMessages},
     error::{Error, Result},
     peer_config::{self, DEFAULT_IDLE_TIMEOUT_MSEC, DEFAULT_KEEP_ALIVE_INTERVAL_MSEC},
 };

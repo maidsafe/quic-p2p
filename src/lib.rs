@@ -65,8 +65,8 @@ mod wire_msg;
 
 pub use api::QuicP2p;
 pub use config::Config;
-pub use connections::{RecvStream, SendStream};
-pub use endpoint::{DisconnectionEvents, Endpoint, IncomingConnections, IncomingMessages};
+pub use connections::{DisconnectionEvents, RecvStream, SendStream};
+pub use endpoint::{Endpoint, IncomingConnections, IncomingMessages};
 pub use error::{Error, Result};
 pub use quinn::ConnectionError;
 

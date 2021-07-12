@@ -17,7 +17,7 @@ use super::{
 use bytes::Bytes;
 use futures::{future, stream::StreamExt};
 use std::net::SocketAddr;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{timeout, Duration};
 use tracing::{error, trace, warn};
 
@@ -26,6 +26,19 @@ use tracing::{error, trace, warn};
 pub(crate) struct Connection {
     quic_conn: quinn::Connection,
     remover: ConnectionRemover,
+}
+
+pub type DisconnectSender = Sender<(SocketAddr, Result<()>)>;
+/// Disconnection events, and the result that led to disconnection.
+pub struct DisconnectionEvents(pub Receiver<(SocketAddr, Result<()>)>);
+
+/// Disconnection
+
+impl DisconnectionEvents {
+    /// Blocks until there is a disconnection event and returns the address of the disconnected peer
+    pub async fn next(&mut self) -> Option<(SocketAddr, Result<()>)> {
+        self.0.recv().await
+    }
 }
 
 impl Connection {
@@ -139,9 +152,9 @@ pub async fn send_msg(mut send_stream: &mut quinn::SendStream, msg: Bytes) -> Re
 pub(super) fn listen_for_incoming_connections(
     mut quinn_incoming: quinn::Incoming,
     connection_pool: ConnectionPool,
-    message_tx: UnboundedSender<(SocketAddr, Bytes)>,
-    connection_tx: UnboundedSender<SocketAddr>,
-    disconnection_tx: UnboundedSender<SocketAddr>,
+    message_tx: Sender<(SocketAddr, Bytes)>,
+    connection_tx: Sender<SocketAddr>,
+    disconnection_tx: DisconnectSender,
     endpoint: Endpoint,
 ) {
     let _ = tokio::spawn(async move {
@@ -156,7 +169,7 @@ pub(super) fn listen_for_incoming_connections(
                     }) => {
                         let peer_address = connection.remote_address();
                         let pool_handle = connection_pool.insert(peer_address, connection).await;
-                        let _ = connection_tx.send(peer_address);
+                        let _ = connection_tx.send(peer_address).await;
                         listen_for_incoming_messages(
                             uni_streams,
                             bi_streams,
@@ -187,20 +200,27 @@ pub(super) fn listen_for_incoming_messages(
     mut uni_streams: quinn::IncomingUniStreams,
     mut bi_streams: quinn::IncomingBiStreams,
     remover: ConnectionRemover,
-    message_tx: UnboundedSender<(SocketAddr, Bytes)>,
-    disconnection_tx: UnboundedSender<SocketAddr>,
+    message_tx: Sender<(SocketAddr, Bytes)>,
+    disconnection_tx: DisconnectSender,
     endpoint: Endpoint,
 ) {
     let src = *remover.remote_addr();
     let _ = tokio::spawn(async move {
-        let _ = future::join(
+        match future::try_join(
             read_on_uni_streams(&mut uni_streams, src, message_tx.clone()),
             read_on_bi_streams(&mut bi_streams, src, message_tx, &endpoint),
         )
-        .await;
+        .await
+        {
+            Ok(_) => {
+                let _ = disconnection_tx.send((src, Ok(()))).await;
+            }
+            Err(error) => {
+                let _ = disconnection_tx.send((src, Err(error))).await;
+            }
+        }
 
         tracing::trace!("The connection to {:?} has been terminated.", src);
-        let _ = disconnection_tx.send(src);
         remover.remove().await;
     });
 }
@@ -209,65 +229,72 @@ pub(super) fn listen_for_incoming_messages(
 async fn read_on_uni_streams(
     uni_streams: &mut quinn::IncomingUniStreams,
     peer_addr: SocketAddr,
-    message_tx: UnboundedSender<(SocketAddr, Bytes)>,
-) {
+    message_tx: Sender<(SocketAddr, Bytes)>,
+) -> Result<()> {
     while let Some(result) = uni_streams.next().await {
         match result {
-            Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+            Err(quinn::ConnectionError::ApplicationClosed(frame)) => {
                 trace!("Connection terminated by peer {:?}.", peer_addr);
-                break;
+                return Err(Error::from(quinn::ConnectionError::ApplicationClosed(
+                    frame,
+                )));
             }
             Err(err) => {
                 warn!(
                     "Failed to read incoming message on uni-stream for peer {:?} with error: {:?}",
                     peer_addr, err
                 );
-                break;
+                return Err(Error::from(err));
             }
             Ok(mut recv) => loop {
                 match read_bytes(&mut recv).await {
                     Ok(WireMsg::UserMsg(bytes)) => {
-                        let _ = message_tx.send((peer_addr, bytes));
+                        let _ = message_tx.send((peer_addr, bytes)).await;
                     }
                     Ok(msg) => error!("Unexpected message type: {:?}", msg),
-                    Err(Error::StreamRead(quinn::ReadExactError::FinishedEarly)) => break,
+                    Err(Error::StreamRead(quinn::ReadExactError::FinishedEarly)) => {
+                        return Err(Error::StreamRead(quinn::ReadExactError::FinishedEarly))
+                    }
                     Err(err) => {
                         error!(
                             "Failed reading from a uni-stream for peer {:?} with error: {:?}",
                             peer_addr, err
                         );
-                        break;
+                        return Err(err);
                     }
                 }
             },
         }
     }
+    Ok(())
 }
 
 // Read messages sent by peer in a bidirectional stream.
 async fn read_on_bi_streams(
     bi_streams: &mut quinn::IncomingBiStreams,
     peer_addr: SocketAddr,
-    message_tx: UnboundedSender<(SocketAddr, Bytes)>,
+    message_tx: Sender<(SocketAddr, Bytes)>,
     endpoint: &Endpoint,
-) {
+) -> Result<()> {
     while let Some(result) = bi_streams.next().await {
         match result {
-            Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+            Err(quinn::ConnectionError::ApplicationClosed(frame)) => {
                 trace!("Connection terminated by peer {:?}.", peer_addr);
-                break;
+                return Err(Error::from(quinn::ConnectionError::ApplicationClosed(
+                    frame,
+                )));
             }
             Err(err) => {
                 warn!(
                     "Failed to read incoming message on bi-stream for peer {:?} with error: {:?}",
                     peer_addr, err
                 );
-                break;
+                return Err(Error::from(err));
             }
             Ok((mut send, mut recv)) => loop {
                 match read_bytes(&mut recv).await {
                     Ok(WireMsg::UserMsg(bytes)) => {
-                        let _ = message_tx.send((peer_addr, bytes));
+                        let _ = message_tx.send((peer_addr, bytes)).await;
                     }
                     Ok(WireMsg::EndpointEchoReq) => {
                         if let Err(error) = handle_endpoint_echo_req(peer_addr, &mut send).await {
@@ -275,6 +302,8 @@ async fn read_on_bi_streams(
                                 "Failed to handle Echo Request for peer {:?} with error: {:?}",
                                 peer_addr, error
                             );
+
+                            return Err(error);
                         }
                     }
                     Ok(WireMsg::EndpointVerificationReq(address_sent)) => {
@@ -287,6 +316,8 @@ async fn read_on_bi_streams(
                         .await
                         {
                             error!("Failed to handle Endpoint verification request for peer {:?} with error: {:?}", peer_addr, error);
+
+                            return Err(error);
                         }
                     }
                     Ok(msg) => {
@@ -295,18 +326,22 @@ async fn read_on_bi_streams(
                             peer_addr, msg
                         );
                     }
-                    Err(Error::StreamRead(quinn::ReadExactError::FinishedEarly)) => break,
+                    Err(Error::StreamRead(quinn::ReadExactError::FinishedEarly)) => {
+                        return Err(Error::StreamRead(quinn::ReadExactError::FinishedEarly))
+                    }
                     Err(err) => {
                         error!(
                             "Failed reading from a bi-stream for peer {:?} with error: {:?}",
                             peer_addr, err
                         );
-                        break;
+                        return Err(err);
                     }
                 }
             },
         }
     }
+
+    Ok(())
 }
 
 async fn handle_endpoint_echo_req(
